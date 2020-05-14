@@ -10,7 +10,6 @@ import modules.submodules as smd
 import modules.utils as utils
 
 
-
 class Net(nn.Module):
 
 
@@ -26,7 +25,7 @@ class Net(nn.Module):
         self.renderer_vis = Renderer(o)
         # self.loss_calculator = nn.DataParallel(LossCalculator(o), device_ids)
         self.loss_calculator = LossCalculator(o)
-        
+
         # Coordinates
         zeros = torch.Tensor(o.N, o.T, 1, o.H, o.W).cuda().fill_(0) # N * T * 1 * H * W
         dh, dw = 2/(o.H-1), 2/(o.W-1)
@@ -65,7 +64,7 @@ class Net(nn.Module):
         ka = {}
         if o.bg == 1:
             ka['Y_b'] = Y_b_seq
-        X_r_seq, area = self.renderer(y_e_seq, y_l_seq, y_p_seq, Y_s_seq, Y_a_seq, **ka) # N * T * D * H * W
+        X_r_seq, area, _ = self.renderer(y_e_seq, y_l_seq, y_p_seq, Y_s_seq, Y_a_seq, **ka) # N * T * D * H * W
 
         # Calculate the loss
         ka = {'y_e': y_e_seq}
@@ -80,13 +79,25 @@ class Net(nn.Module):
 
         # Visualize
         if o.v  > 0:
-            ka = {'X': X_seq, 'X_r': X_r_seq, 'y_e': y_e_seq, 'y_l': y_l_seq, 'y_p': y_p_seq, 
+            downsampled_pred = nn.functional.interpolate(X_r_seq.view(-1,o.D,o.H,o.W), scale_factor=0.5)
+            downsampled_target = nn.functional.interpolate(X_seq.view(-1,o.D,o.H,o.W), scale_factor=0.5)
+
+            loss = nn.functional.mse_loss(downsampled_pred, downsampled_target, reduction='sum')
+
+            video = {}
+            video['class'] = 'video'
+            video['filename'] = 'video_id_{}'.format(o.batch_id)
+
+            ka = {'X': X_seq, 'X_r': X_r_seq, 'y_e': y_e_seq, 'y_l': y_l_seq, 'y_p': y_p_seq,
                   'Y_s': Y_s_seq, 'Y_a': Y_a_seq}
             if o.bg == 1:
                 ka['Y_b'] = Y_b_seq
                 if o.metric == 1:
                     ka['X_org'] = kwargs['X_org_seq']
-            self.visualize(**ka)
+            frames = self.visualize(**ka)
+            video['frames'] = frames
+
+            return loss, video
 
         return loss
 
@@ -117,9 +128,10 @@ class Net(nn.Module):
         # print(mem_min, mem_max)
         mem = (mem - mem_min) / (mem_max - mem_min + 1e-20)
 
+        frames = []
         for t in range(0, o.T):
             tao = o.batch_id * o.T + t
-            
+
             # Images
             for img_kw, img_arg in show_dict.items():
                 img = img_arg.data[n, t].permute(1, 2, 0).clamp(0, 1)
@@ -140,19 +152,19 @@ class Net(nn.Module):
             y_p = kwargs['y_p'].data[n:n+1].clone()
             Y_s = kwargs['Y_s'].data[n:n+1].clone() # 1 * T * O * 1 * h * w
             Y_a = kwargs['Y_a'].data[n:n+1].clone() # 1 * T * O * D * h * w
-            Y_s.data[:, :, :, :, 0, :].fill_(1)
-            Y_s.data[:, :, :, :, -1, :].fill_(1)
-            Y_s.data[:, :, :, :, :, 0].fill_(1)
-            Y_s.data[:, :, :, :, :, -1].fill_(1)
-            Y_a.data[:, :, :, :, 0, :].fill_(1)
-            Y_a.data[:, :, :, :, -1, :].fill_(1)
-            Y_a.data[:, :, :, :, :, 0].fill_(1)
-            Y_a.data[:, :, :, :, :, -1].fill_(1)
+            # Y_s.data[:, :, :, :, 0, :].fill_(1)
+            # Y_s.data[:, :, :, :, -1, :].fill_(1)
+            # Y_s.data[:, :, :, :, :, 0].fill_(1)
+            # Y_s.data[:, :, :, :, :, -1].fill_(1)
+            # Y_a.data[:, :, :, :, 0, :].fill_(1)
+            # Y_a.data[:, :, :, :, -1, :].fill_(1)
+            # Y_a.data[:, :, :, :, :, 0].fill_(1)
+            # Y_a.data[:, :, :, :, :, -1].fill_(1)
             if o.bg == 0:
-                X_r_vis, _a = self.renderer_vis(y_e_vis, y_l, y_p, Y_s, Y_a) # 1 * T * D * H * W
+                X_r_vis, _a, X_s_split_vis = self.renderer_vis(y_e_vis, y_l, y_p, Y_s, Y_a) # 1 * T * D * H * W
             else:
                 Y_b = kwargs['Y_b'].data[n:n+1].clone()
-                X_r_vis, _a = self.renderer_vis(y_e_vis, y_l, y_p, Y_s, Y_a, Y_b=Y_b) # 1 * T * D * H * W
+                X_r_vis, _a, X_s_split_vis = self.renderer_vis(y_e_vis, y_l, y_p, Y_s, Y_a, Y_b=Y_b) # 1 * T * D * H * W
             img = X_r_vis.data[0, t, 0:o.D].permute(1, 2, 0).clamp(0, 1)
             if o.v == 1:
                 utils.imshow(img, H, W, 'X_r_vis')
@@ -163,19 +175,45 @@ class Net(nn.Module):
             # Objects
             y_e, Y_s, Y_a = y_e.data[0, t], Y_s.data[0, t], Y_a.data[0, t] # O * D * h * w
             if o.task == 'mnist':
-                Y_o = (y_e.view(-1, 1, 1, 1) * Y_a).permute(2, 0, 3, 1).reshape(o.h, o.O*o.w, o.D)
+                # Y_o = (y_e.view(-1, 1, 1, 1) * Y_a).permute(2, 0, 3, 1).reshape(o.h, o.O*o.w, o.D)
                 Y_o_v = (y_e.view(-1, 1, 1, 1) * Y_a).permute(0, 2, 3, 1).reshape(o.O*o.h, o.w, o.D)
             else:
-                Y_o = (y_e.view(-1, 1, 1, 1) * Y_s * Y_a).permute(2, 0, 3, 1).reshape(o.h, o.O*o.w, o.D)
+                # Y_o = (y_e.view(-1, 1, 1, 1) * Y_s * Y_a).permute(2, 0, 3, 1).reshape(o.h, o.O*o.w, o.D)
                 Y_o_v = (y_e.view(-1, 1, 1, 1) * Y_a * Y_a).permute(0, 2, 3, 1).reshape(o.O*o.h, o.w, o.D)
-            if o.v == 1:
-                utils.imshow(Y_o, h, w * o.O, 'Y_o', 1)
-            else:
-                utils.mkdir(path.join(save_dir, 'Y_o'))
-                utils.imwrite(Y_o, path.join(save_dir, 'Y_o', "%05d" % (tao)))
-            # utils.imshow(Y_o_v, h, w * o.O, 'Y_o_v')
-            # utils.mkdir(path.join(save_dir, 'Y_o_v'))
-            # utils.imwrite(Y_o_v, path.join(save_dir, 'Y_o_v', "%05d" % (tao)))
+            if o.v == 2:
+                # utils.mkdir(path.join(save_dir, 'Y_o'))
+                # utils.imwrite(Y_o, path.join(save_dir, 'Y_o', "%05d" % (tao)))
+                utils.mkdir(path.join(save_dir, 'Y_o_v'))
+                utils.imwrite(Y_o_v, path.join(save_dir, 'Y_o_v', "%05d" % (tao)))
+
+            # Object masks
+            X_s_s = torch.stack(X_s_split_vis, dim=2).data[t, 0].reshape(1, 1, o.O*o.H, o.W)
+            # Resize and clear noise
+            X_s_s_pool = (1-nn.functional.max_pool2d(1-X_s_s, 2)).reshape(o.O, o.H//2, o.W//2)
+
+            frame = {}
+            frame['timestamp'] = int(t)
+            frame['num'] = int(tao)
+            frame['class'] = 'frame'
+
+            annotations = []
+            for j in range(0,o.O):
+                bin_img = X_s_s_pool[j].cpu().numpy().astype(np.int)
+                if bin_img.sum() == 0:
+                    continue
+                else:
+                    annotation = {
+                        'mask': utils.rle_encode(bin_img),
+                        'id': int(o.O * o.batch_id + j),
+                    }
+                    annotations.append(annotation)
+            frame['annotations'] = annotations
+            frames.append(frame)
+
+            X_s_s_pool = X_s_s_pool.reshape(o.O*o.H//2, o.W//2, 1).repeat(1, 1, 3)
+            if o.v == 2:
+                utils.mkdir(path.join(save_dir, 'X_s_s'))
+                utils.imwrite(X_s_s_pool, path.join(save_dir, 'X_s_s', "%05d" % (tao)))
 
             # Attention and memory
             if o.task != 'duke':
@@ -192,6 +230,8 @@ class Net(nn.Module):
                     utils.imwrite(att_c, path.join(save_dir, 'att', "%05d" % (tao)))
                     utils.imwrite(mem_c, path.join(save_dir, 'mem', "%05d" % (tao)))
 
+        return frames
+
 
     def reset_states(self):
         for state in self.states.values():
@@ -206,5 +246,3 @@ class Net(nn.Module):
     def save_states(self, **kwargs):
         for kw, arg in kwargs.items():
             self.states[kw].copy_(arg.data[:, -1])
-
-

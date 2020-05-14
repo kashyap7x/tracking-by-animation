@@ -7,7 +7,7 @@ import modules.utils as utils
 
 
 class TrackerArray(nn.Module):
-    
+
     def __init__(self, o):
         super(TrackerArray, self).__init__()
         self.o = o
@@ -41,7 +41,7 @@ class TrackerArray(nn.Module):
 
 
 class NTM(nn.Module):
-    
+
     def __init__(self, o):
         super(NTM, self).__init__()
         self.o = o
@@ -99,7 +99,7 @@ class NTM(nn.Module):
             r = perm_mat_inv.bmm(r) # N * O * dim_c_2
             att = perm_mat_inv.data[self.ntm_cell.n].mm(att.view(o.O, -1)).view(o.O, -1, self.ntm_cell.wa) # O * ha * wa
             mem = perm_mat_inv.data[self.ntm_cell.n].mm(mem.view(o.O, -1)).view(o.O, -1, self.ntm_cell.wa) # O * ha * wa
-        
+
         if o.v > 0:
             self.att[self.t].copy_(att)
             self.mem[self.t].copy_(mem)
@@ -217,7 +217,7 @@ class NTMCell(nn.Module):
         r = w1.bmm(C).squeeze(1) # N * C2_2
         # RNN
         h_o = self.rnn_cell(r, h_o_prev)
-        
+
         if "no_mem" not in o.exp_config:
             # Erase vector
             e = self.linear_e(h_o).sigmoid().unsqueeze(1) # N * 1 * C2_2

@@ -30,7 +30,9 @@ class LossCalculator(nn.Module):
         losses['recon'] = loss_recon.item()
 
         # Tightness loss
-        lam_t = 0.1 if o.task == 'duke' else 13
+        lam_t = 0.1 if (o.task == 'duke' or o.task == 'vor') else 13
+        if torch.cuda.device_count() > 1:
+            area = area[0]
         loss_tight = lam_t * area
         loss = loss + loss_tight
         losses['tight'] = loss_tight.item()

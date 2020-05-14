@@ -27,7 +27,7 @@ class Renderer(nn.Module):
         area = area.sum() / o.O
 
         # Spatial transform
-        Y_s = Y_s.view(-1, 1, o.h, o.w) * y_e # NTO * 1 * h * w 
+        Y_s = Y_s.view(-1, 1, o.h, o.w) * y_e # NTO * 1 * h * w
         Y_a = Y_a.view(-1, o.D, o.h, o.w) * Y_s # NTO * D * h * w
         X_s = nn.functional.grid_sample(Y_s, grid, align_corners=False) # NTO * 1 * H * W
         X_a = nn.functional.grid_sample(Y_a, grid, align_corners=False) # NTO * D * H * W
@@ -37,6 +37,7 @@ class Renderer(nn.Module):
         X_a = X_a.view(-1, o.O, o.D * o.H * o.W) # NT * O * DHW
         y_l = y_l.view(-1, o.O, o.dim_y_l) # NT * O * dim_y_l
         y_l = y_l.transpose(1, 2) # NT * dim_y_l * O
+        X_s_split_vis = torch.unbind(X_s.view(-1, o.O, 1, o.H, o.W).clamp(max=1), 1)  # [NT * 1 * H * W], len = O
         X_s = y_l.bmm(X_s).clamp(max=1) # NT * dim_y_l * 1HW
         X_a = y_l.bmm(X_a) # NT * dim_y_l * DHW
         if o.task == 'mnist':
@@ -49,9 +50,18 @@ class Renderer(nn.Module):
         for i in range(0, o.dim_y_l):
             # X_r = X_r + X_s_split[i] * (X_a_split[i] - X_r)
             X_r = X_r * (1 - X_s_split[i]) + X_a_split[i]
-        X_r = X_r.view(-1, o.T, o.D, o.H, o.W) # N * T * D * H * W
 
-        return X_r, area
+        # Apply occlusion to visualized masks
+        if o.metric == 1 and o.v == 2:
+            for i in range(0, o.O):
+                layer = torch.nonzero(y_l[:,:,i])[:,-1]
+                for t in range(0, o.T):
+                    l = int(layer[t].cpu().numpy())
+                    for j in range(l+1, o.dim_y_l):
+                        X_s_split_vis[i][t] = X_s_split_vis[i][t] * (1 - X_s_split[j][t])
+
+        X_r = X_r.view(-1, o.T, o.D, o.H, o.W) # N * T * D * H * W
+        return X_r, area, X_s_split_vis
 
 
     def get_sampling_grid(self, y_e, y_p):
@@ -63,9 +73,19 @@ class Renderer(nn.Module):
 
         # Generate 2D transformation matrix
         scale, ratio, trans_x, trans_y = y_p.split(1, 1) # N * 1
+        if o.task == 'vor':
+            scale = (1 + scale)/2
         scale = 1 + o.zeta_s*scale
         ratio = o.zeta_r[0] + o.zeta_r[1]*ratio
         ratio_sqrt = ratio.sqrt()
+
+        # Background slot
+        # if o.task == 'vor':
+        #     scale.view(-1,o.T,o.O)[:,:,0] = 8
+        #     ratio.view(-1,o.T,o.O)[:,:,0] = 1
+        #     trans_x.view(-1,o.T,o.O)[:,:,0] = 0
+        #     trans_y.view(-1,o.T,o.O)[:,:,0] = 0
+
         area = scale * scale
         h_new = o.h * scale * ratio_sqrt
         w_new = o.w * scale / ratio_sqrt
@@ -75,7 +95,7 @@ class Renderer(nn.Module):
             trans_x = (1 - (o.w*2/3)/o.W) * trans_x
             trans_y = (1 - (o.h*2/3)/o.H) * trans_y
         zero = trans_x.data.clone().zero_() # N * 1
-        trans_mat = torch.cat((scale_x, zero, scale_x * trans_x, zero, scale_y, 
+        trans_mat = torch.cat((scale_x, zero, scale_x * trans_x, zero, scale_y,
                                scale_y * trans_y), 1).view(-1, 2, 3) # N * 2 * 3
 
         # Convert to bounding boxes and save

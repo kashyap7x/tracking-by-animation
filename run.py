@@ -14,14 +14,14 @@ from modules.net import Net
 # Parse arguments
 parser = argparse.ArgumentParser()
 # Task
-parser.add_argument('--task', default='duke', choices=['mnist', 'sprite', 'duke'],
-                    help="Choose a task from mnist/sprite/duke")
+parser.add_argument('--task', default='duke', choices=['mnist', 'sprite', 'spmot', 'vor', 'duke'],
+                    help="Choose a task from mnist/sprite/spmot/vor/duke")
 parser.add_argument('--subtask', default='',
                     help="Choose a subtask for duke, from camera1 to camera8 ('' for all cameras)")
 parser.add_argument('--exp', default='tba',
                     help="Choose an experiment from tba/tbac/tbac_no_occ/tbac_no_att/tbac_no_mem/tbac_no_rep")
 parser.add_argument('--model', default='default',
-                    help="Choose a model with different hyper-parameters (specified in 'modules/model_config.json')") 
+                    help="Choose a model with different hyper-parameters (specified in 'modules/model_config.json')")
 parser.add_argument('--train', type=int, default=1, choices=[0, 1],
                     help="Choose to train (1) or test (0) the model")
 parser.add_argument('--metric', type=int, default=0, choices=[0, 1],
@@ -32,19 +32,19 @@ parser.add_argument('--init_model', default='',
 parser.add_argument('--r', type=int, default=1, choices=[0, 1],
                     help="Choose whether to remember the recurrent state from the previous sequence")
 # Training
-parser.add_argument('--epoch_num', type=int, default=500,
+parser.add_argument('--epoch_num', type=int, default=1000,
                     help="The number of training epoches")
 parser.add_argument('--reset_interval', type=float, default=0.01,
                     help="Set how to reset the recurrent state, \
                     (-inf, 0): do not reset, [0, 1): the probability to reset, [1, inf): time steps to reset")
 parser.add_argument('--print_interval', type=int, default=1,
-                    help="Iterations to print training messages") 
+                    help="Iterations to print training messages")
 parser.add_argument('--train_log_interval', type=int, default=100,
-                    help="Iterations to log training messages") 
+                    help="Iterations to log training messages")
 parser.add_argument('--save_interval', type=int, default=100,
-                    help="Iterations to save checkpoints (will be overwitten)") 
+                    help="Iterations to save checkpoints (will be overwitten)")
 parser.add_argument('--validate_interval', type=int, default=1000,
-                    help="Iterations to validate model and save checkpoints") 
+                    help="Iterations to validate model and save checkpoints")
 # Optimization
 parser.add_argument('--lr', type=float, default=5e-4,
                     help="Learning rate")
@@ -93,7 +93,7 @@ for k, v in model_config.items():
     vars(o)[k] = v
 print("Model: " + o.model)
 # Set other hyper-parameters
-if o.task in ['mnist', 'sprite']:
+if o.task in ['mnist', 'sprite', 'spmot', 'vor']:
     o.bg = 0
 elif o.task in ['duke']:
     o.bg = 1
@@ -162,6 +162,12 @@ def load_data(batch_id, split):
 # Forward function
 def forward(X_seq, **kwargs):
     start_time = time.time()
+
+    if o.v > 0:
+        loss, video = net(X_seq, **kwargs)
+        elapsed_time = time.time() - start_time
+        return loss, elapsed_time, video
+
     loss = net(X_seq, **kwargs)
     elapsed_time = time.time() - start_time
     return loss, elapsed_time
@@ -190,6 +196,10 @@ def run_batch(batch_id, split):
         backward_time = backward(loss)
     else:
         with torch.no_grad():
+            if o.v > 0:
+                loss, forward_time, video = forward(X_seq, **kwargs)
+                return loss.item(), video
+
             loss, forward_time = forward(X_seq, **kwargs)
         backward_time = 0
     if o.s == 1:
@@ -203,14 +213,21 @@ def run_test_epoch():
     net.reset_states()
     net.eval()
     val_loss_sum = 0
+    videos = []
     for batch_id in range(0, o.test_batch_num):
         o.batch_id = batch_id
-        loss = run_batch(batch_id, 'test')
+        if o.v  > 0:
+            loss, video = run_batch(batch_id, 'test')
+            videos.append(video)
+        else:
+            loss = run_batch(batch_id, 'test')
         val_loss_sum = val_loss_sum + loss
         print('Validation %d / %d, loss = %.3f'% (batch_id+1, o.test_batch_num, loss))
     val_loss = val_loss_sum / o.test_batch_num
     print('Final validation loss: %.3f'% (val_loss))
     net.states = torch.load(result_file_header + 'tmp.pt')
+    if o.v > 0:
+        utils.save_json(videos, path.join(o.pic_dir, 'tba_mot_annotations_masks.json'))
     return val_loss
 
 
@@ -232,7 +249,7 @@ def run_train_epoch(batch_id_start):
             print('---------- State Reset ----------')
             net.reset_states()
         if o.print_interval > 0 and i % o.print_interval == 0:
-            print('Epoch: %.2f/%d, iter: %d/%d, batch: %d/%d, loss: %.3f'% 
+            print('Epoch: %.2f/%d, iter: %d/%d, batch: %d/%d, loss: %.3f'%
                   (i/o.train_batch_num, o.epoch_num, i, iter_num, batch_id+1, o.train_batch_num, loss))
         if o.train_log_interval > 0 and i % o.train_log_interval == 0:
             benchmark['train_loss'].append((i, train_loss_sum/o.train_log_interval))

@@ -6,33 +6,37 @@ from joblib import Parallel, delayed
 import multiprocessing
 import math
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 import sys
 sys.path.append("modules")
 import utils
 
 
+torch.manual_seed(0)
 parser = argparse.ArgumentParser()
 parser.add_argument('--v', type=int, default=0)
-parser.add_argument('--metric', type=int, default=0)
+parser.add_argument('--metric', type=int, default=1)
 arg = parser.parse_args()
 
+
 N = 1 if arg.metric == 1 else 64
-T = 20
+T = 10
 H = 128
 W = 128
 D = 3
 h = 21
 w = 21
 O = 3
-frame_num = 1e4 if arg.metric == 1 else 2e6
+frame_num = 1e4 if arg.metric == 1 else 1e5
 train_ratio = 0 if arg.metric == 1 else 0.96
 birth_prob = 0.5
 appear_interval = 5
 scale_var = 0.1
 ratio_var = 0.2
 velocity = 5.3
-task = 'sprite'
+task = 'spmot'
 m = h // 2
 eps = 1e-5
 
@@ -76,10 +80,10 @@ triangle = shape_temp[2]
 for i in range(0, h):
     for j in range(0, w):
         if j <= w/2 - 1:
-            if (h - i) / (j + 1) <= h / (w / 2): 
+            if (h - i) / (j + 1) <= h / (w / 2):
                 triangle[i, j] = 255
         else:
-            if (h - i) / (w - j) <= h / (w / 2): 
+            if (h - i) / (w - j) <= h / (w / 2):
                 triangle[i, j] = 255
 # diamond
 diamond = shape_temp[3]
@@ -117,9 +121,12 @@ def process_batch(states, batch_id):
     position_id = torch.rand(T, O, 2).mul_(H-2*m).add_(m).floor_().long() # [m, H-m-1]
     scales = torch.rand(T, O).mul_(2).add_(-1).mul_(scale_var).add_(1) # [1 - var, 1 + var]
     ratios = torch.rand(T, O).mul_(2).add_(-1).mul_(ratio_var).add_(1).sqrt_() # [sqrt(1 - var), sqrt(1 + var)]
+    frames = []
     for t in range(0, T):
+        tao = batch_id * T + t
+        buffer_label = torch.FloatTensor(H, W, O).zero_()
         for o in range(0, O):
-            if states[o][0] < appear_interval: # wait for interval frames 
+            if states[o][0] < appear_interval: # wait for interval frames
                 states[o][0] = states[o][0] + 1
             elif states[o][0] == appear_interval: # allow birth
                 if unif[t][o].item() < birth_prob: # birth
@@ -191,17 +198,44 @@ def process_batch(states, batch_id):
                     # synthesize a frame
                     org_img_f = org_seq[t].float() # H * W * D
                     syn_image = org_img_f + shape_img_f/255 * (color_img_f - org_img_f)
+                    buffer_label[:,:,o] = shape_img_f[:,:,0]/255
+                    for i in range(0, o):
+                        buffer_label[:,:,i] *= 1-shape_img_f[:,:,0]/255
                     org_seq[t].copy_(syn_image.round().byte())
                     # update the position
                     states[o][7] = states[o][7] + 1
                     # save for metric evaluation
                     if arg.metric == 1:
-                        file.write("%d,%d,%.3f,%.3f,%.3f,%.3f,1,-1,-1,-1\n" % 
+                        file.write("%d,%d,%.3f,%.3f,%.3f,%.3f,1,-1,-1,-1\n" %
                             (batch_id*T+t+1, states[o][8]+1, left-w+1, top-h+1, w_, h_))
-    return org_seq, states
+
+        if arg.metric == 1:
+            frame = {}
+            frame['timestamp'] = int(t)
+            frame['num'] = int(tao)
+            frame['class'] = 'frame'
+
+            annotations = []
+
+            for j in range(0,O):
+                bin_img = nn.functional.interpolate(buffer_label[:,:,j].reshape(1,1,H,W), scale_factor=0.5)
+                bin_img = (bin_img!=0).numpy().astype(np.int)
+                if bin_img.sum() == 0:
+                    continue
+                else:
+                    annotation = {
+                        'mask': utils.rle_encode(bin_img),
+                        'id': int(O * batch_id + j),
+                    }
+                    annotations.append(annotation)
+            frame['annotations'] = annotations
+            frames.append(frame)
+
+    return org_seq, states, frames
 
 
 states_batch = []
+videos = []
 for n in range(0, N):
     states_batch.append([])
     for o in range(0, O):
@@ -210,10 +244,16 @@ with Parallel(n_jobs=core_num, backend="threading") as parallel:
     for split in ['train', 'test']:
         S = batch_nums[split]
         for s in range(0, S): # for each batch of sequences
+            video = {}
+            video['class'] = 'video'
+            video['filename'] = 'video_id_{}'.format(s)
             out_batch = parallel(delayed(process_batch)(states_batch[n], s) for n in range(0, N)) # N * 2 * T * H * W * D
             out_batch = list(zip(*out_batch)) # 2 * N * T * H * W * D
             org_seq_batch = torch.stack(out_batch[0], dim=0) # N * T * H * W * D
             states_batch = out_batch[1] # N * []
+            frames = out_batch[2][0]
+            video['frames'] = frames
+            videos.append(video)
             if arg.v == 1:
                 for t in range(0, T):
                     utils.imshow(org_seq_batch[0, t], 400, 400, 'img', 50)
@@ -221,14 +261,16 @@ with Parallel(n_jobs=core_num, backend="threading") as parallel:
                 org_seq_batch = org_seq_batch.permute(0, 1, 4, 2, 3) # N * T * D * H * W
                 filename = split + '_' + str(s) + '.pt'
                 torch.save(org_seq_batch, path.join(output_input_dir, filename))
+
             print(split + ': ' + str(s+1) + ' / ' + str(S))
 if arg.metric == 1:
     file.close()
+    utils.save_json(videos, path.join(output_gt_dir, 'spmot_test_gt_mot_annotations_masks.json'))
 
 # save the data configuration
 data_config = {
     'task': task,
-    'train_batch_num': batch_nums['train'], 
+    'train_batch_num': batch_nums['train'],
     'test_batch_num': batch_nums['test'],
     'N': N,
     'T': T,
